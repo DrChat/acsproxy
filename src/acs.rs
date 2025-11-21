@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 /// Represents an email address with optional display name
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct EmailAddress {
     /// Email address
@@ -17,7 +17,7 @@ pub struct EmailAddress {
 }
 
 /// Email content
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct EmailContent {
     /// Subject of the email
@@ -31,7 +31,7 @@ pub struct EmailContent {
 }
 
 /// Recipients for the email
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct EmailRecipients {
     /// Email To recipients
@@ -45,7 +45,7 @@ pub struct EmailRecipients {
 }
 
 /// Attachment to the email
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct EmailAttachment {
     /// Name of the attachment

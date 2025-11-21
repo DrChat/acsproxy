@@ -1,11 +1,12 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 
 use anyhow::Context;
 use azure_core::auth::TokenCredential;
+use base64::{Engine, prelude::BASE64_STANDARD};
 use clap::Parser;
 use clap_verbosity_flag::{InfoLevel, LevelFilter, Verbosity};
 use figment::{Figment, providers::Format};
-use mail_parser::MessageParser;
+use mail_parser::{MessageParser, MimeHeaders};
 use regex::Regex;
 use serde::Deserialize;
 use tokio::{
@@ -34,6 +35,7 @@ struct SmtpStatus(u32);
 impl SmtpStatus {
     // RFC 5321, section 4.2.2
     // https://www.rfc-editor.org/rfc/rfc5321#section-4.2.2
+    const SERVICE_READY: Self = Self(220);
     const BYE: Self = Self(221);
     const OK: Self = Self(250);
 
@@ -47,6 +49,7 @@ impl SmtpStatus {
     const ERROR_MAILBOX_UNAVAILABLE: Self = Self(550);
 }
 
+#[derive(Debug, Clone, PartialEq)]
 struct SmtpResult {
     code: SmtpStatus,
     mesg: String,
@@ -122,6 +125,26 @@ impl SmtpResult {
     }
 }
 
+impl FromStr for SmtpResult {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let line = s.trim_end_matches("\r\n");
+
+        if let Some((code_str, message)) = line.split_once(' ') {
+            if let Ok(code) = code_str.parse::<u32>() {
+                return Ok(Self {
+                    code: SmtpStatus(code),
+                    mesg: message.to_string(),
+                });
+            }
+        }
+
+        // Malformed response - return error
+        Err(format!("Invalid SMTP response: {}", line))
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 struct AppConfig {
     /// Address to listen to for incoming requests
@@ -141,9 +164,8 @@ struct Args {
 }
 
 async fn handle_connection(
-    mut stream: TcpStream,
-    endpoint: Url,
-    token: Arc<dyn TokenCredential>,
+    stream: TcpStream,
+    mut send_mail: impl AsyncFnMut(acs::EmailMessage) -> SmtpResult,
 ) -> anyhow::Result<()> {
     // Minimum implementation (RFC 5321, section 4.5.1)
     // EHLO
@@ -167,7 +189,7 @@ async fn handle_connection(
     let mut send = None;
     let mut rcpt = Vec::<String>::new();
 
-    w.write_all(b"220 Service ready\r\n")
+    w.write_all(&SmtpResult::new(SmtpStatus::SERVICE_READY, "Service ready").into_bytes())
         .await
         .context("failed to send greeting")?;
 
@@ -189,7 +211,6 @@ async fn handle_connection(
         // DEBUG: Print the received line.
         tracing::debug!("=> {buf}");
 
-        // Uh, hopefully the space is always required.
         let resp = {
             // Split the verb from the parameter. If there is no parameter, default to a blank string.
             let (cmd, param) = buf.split_once_opt(" ");
@@ -289,6 +310,38 @@ async fn handle_connection(
 
                         if let Some(message) = MessageParser::default().parse(&data) {
                             let subject = message.subject();
+                            let mut attachments = Vec::new();
+
+                            // Loop through each attachment and convert them to an ACS-compatible attachment.
+                            for attachment in message.attachments() {
+                                let name = if let Some(name) = attachment.attachment_name() {
+                                    name.to_string()
+                                } else {
+                                    continue;
+                                };
+                                let ty = if let Some(ty) = attachment.content_type() {
+                                    format!(
+                                        "{}{}",
+                                        ty.c_type,
+                                        if let Some(sub) = &ty.c_subtype {
+                                            format!("/{sub}")
+                                        } else {
+                                            format!("")
+                                        }
+                                    )
+                                } else {
+                                    continue;
+                                };
+
+                                attachments.push(acs::EmailAttachment {
+                                    name: name,
+                                    content_type: ty,
+                                    content_in_base64: BASE64_STANDARD
+                                        .encode(attachment.contents()),
+                                    content_id: attachment.content_id().map(str::to_string),
+                                })
+                            }
+
                             let mail = acs::EmailMessage {
                                 sender_address: send.as_deref().unwrap_or("noreply").to_string(),
                                 content: acs::EmailContent {
@@ -305,12 +358,16 @@ async fn handle_connection(
                                             display_name: None,
                                         })
                                         .collect::<Vec<_>>(),
-                                    cc: None,
-                                    bcc: None,
+                                    cc: None,  // TODO
+                                    bcc: None, // TODO
                                 },
-                                headers: None,
-                                attachments: None,
-                                reply_to: None,
+                                headers: None, // TODO
+                                attachments: if attachments.len() != 0 {
+                                    Some(attachments)
+                                } else {
+                                    None
+                                },
+                                reply_to: None, // TODO
                                 user_engagement_tracking_disabled: None,
                             };
 
@@ -318,52 +375,7 @@ async fn handle_connection(
                                 tracing::debug!("{msg}");
                             }
 
-                            let r = (async || {
-                                let r = acs::send_email(&endpoint, mail, token.clone()).await?;
-                                acs::wait_email(&endpoint, r, token.clone()).await
-                            })()
-                            .await;
-
-                            match r {
-                                Err(e) => {
-                                    SmtpResult::new(SmtpStatus::ERROR_PROCESSING, format!("{e}"))
-                                }
-                                Ok(r) => {
-                                    match r.status {
-                                        acs::EmailSendStatus::NotStarted
-                                        | acs::EmailSendStatus::Running => {
-                                            // This should not be possible.
-                                            SmtpResult::new(
-                                                SmtpStatus::ERROR_PROCESSING,
-                                                format!(
-                                                    "delivery returned non-terminal status {:?}",
-                                                    r.status
-                                                ),
-                                            )
-                                        }
-                                        acs::EmailSendStatus::Succeeded => SmtpResult::new(
-                                            SmtpStatus::OK,
-                                            format!("UUID {}", r.id),
-                                        ),
-                                        acs::EmailSendStatus::Failed => SmtpResult::new(
-                                            SmtpStatus::ERROR_MAILBOX_UNAVAILABLE,
-                                            if let Some(err) = r.error {
-                                                format!(
-                                                    "{} {}",
-                                                    err.code.as_deref().unwrap_or("<unk>"),
-                                                    err.message.as_deref().unwrap_or("<unk>"),
-                                                )
-                                            } else {
-                                                format!("delivery failed")
-                                            },
-                                        ),
-                                        acs::EmailSendStatus::Canceled => SmtpResult::new(
-                                            SmtpStatus::ERROR_PROCESSING,
-                                            format!("UUID {}", r.id),
-                                        ),
-                                    }
-                                }
-                            }
+                            send_mail(mail).await
                         } else {
                             // FIXME: Is this correct?
                             SmtpResult::new(
@@ -411,6 +423,51 @@ async fn handle_connection(
     }
 
     Ok(())
+}
+
+async fn send_acs(
+    config: AppConfig,
+    token: Arc<dyn TokenCredential>,
+    mail: acs::EmailMessage,
+) -> SmtpResult {
+    let r = (async || {
+        let r = acs::send_email(&config.endpoint, mail, token.clone()).await?;
+        acs::wait_email(&config.endpoint, r, token.clone()).await
+    })()
+    .await;
+
+    match r {
+        Err(e) => SmtpResult::new(SmtpStatus::ERROR_PROCESSING, format!("{e}")),
+        Ok(r) => {
+            match r.status {
+                acs::EmailSendStatus::NotStarted | acs::EmailSendStatus::Running => {
+                    // This should not be possible.
+                    SmtpResult::new(
+                        SmtpStatus::ERROR_PROCESSING,
+                        format!("delivery returned non-terminal status {:?}", r.status),
+                    )
+                }
+                acs::EmailSendStatus::Succeeded => {
+                    SmtpResult::new(SmtpStatus::OK, format!("UUID {}", r.id))
+                }
+                acs::EmailSendStatus::Failed => SmtpResult::new(
+                    SmtpStatus::ERROR_MAILBOX_UNAVAILABLE,
+                    if let Some(err) = r.error {
+                        format!(
+                            "{} {}",
+                            err.code.as_deref().unwrap_or("<unk>"),
+                            err.message.as_deref().unwrap_or("<unk>"),
+                        )
+                    } else {
+                        format!("delivery failed")
+                    },
+                ),
+                acs::EmailSendStatus::Canceled => {
+                    SmtpResult::new(SmtpStatus::ERROR_PROCESSING, format!("UUID {}", r.id))
+                }
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -471,11 +528,15 @@ async fn main() -> anyhow::Result<()> {
             result = listener.accept() => {
                 match result {
                     Ok((sock, _addr)) => {
+                        let config = config.clone();
+                        let token = token.clone();
+
                         // Hand the connection off to a new task.
                         tokio::spawn(handle_connection(
                             sock,
-                            config.endpoint.clone(),
-                            token.clone(),
+                            async move |message| {
+                                send_acs(config.clone(), token.clone(), message).await
+                            },
                         ));
                     }
                     Err(e) => {
@@ -496,6 +557,48 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn mock_send_ok(_message: acs::EmailMessage) -> SmtpResult {
+        SmtpResult::ok()
+    }
+
+    /// Helper to read a line from a stream
+    async fn read_line(stream: &mut TcpStream) -> SmtpResult {
+        let mut buf = String::new();
+        let mut rdr = BufReader::new(stream);
+
+        rdr.read_line(&mut buf).await.unwrap();
+        buf.parse().unwrap()
+    }
+
+    /// Helper to read a line and assert the status code matches expected
+    async fn read_line_assert(stream: &mut TcpStream, expected_code: SmtpStatus) -> SmtpResult {
+        let result = read_line(stream).await;
+        assert_eq!(
+            result.code, expected_code,
+            "Expected status code {}, got {}. Message: {}",
+            expected_code.0, result.code.0, result.mesg
+        );
+        result
+    }
+
+    /// Helper to write a command to the stream
+    async fn write_command(stream: &mut TcpStream, cmd: &str) {
+        stream.write_all(cmd.as_bytes()).await.unwrap();
+        stream.write_all(b"\r\n").await.unwrap();
+    }
+
+    async fn write_command_expect(
+        stream: &mut TcpStream,
+        cmd: &str,
+        expected: SmtpStatus,
+    ) -> SmtpResult {
+        write_command(stream, cmd).await;
+        read_line_assert(stream, expected).await
+    }
 
     #[test]
     fn test_smtp_result_into_bytes_single_line() {
@@ -530,5 +633,282 @@ mod tests {
         let result = SmtpResult::new(SmtpStatus::OK, "");
         let bytes = result.into_bytes();
         assert_eq!(bytes, b"250 \r\n");
+    }
+
+    /// Test bad command sequences (e.g., MAIL before HELO, RCPT before MAIL)
+    #[tokio::test]
+    async fn test_smtp_bad_sequence() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream, mock_send_ok).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        read_line_assert(&mut client, SmtpStatus::SERVICE_READY).await;
+
+        // Try MAIL without HELO first
+        write_command_expect(
+            &mut client,
+            "MAIL FROM:<sender@example.com>",
+            SmtpStatus::ERROR_BAD_SEQUENCE,
+        )
+        .await;
+
+        // Now do proper HELO
+        write_command_expect(&mut client, "HELO client.example.com", SmtpStatus::OK).await;
+
+        // Try RCPT without MAIL
+        write_command_expect(
+            &mut client,
+            "RCPT TO:<recipient@example.com>",
+            SmtpStatus::ERROR_BAD_SEQUENCE,
+        )
+        .await;
+
+        write_command_expect(&mut client, "QUIT", SmtpStatus::BYE).await;
+
+        drop(client);
+        let _ = server.await;
+    }
+
+    /// Test syntax errors and unknown commands
+    #[tokio::test]
+    async fn test_smtp_syntax_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream, mock_send_ok).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        read_line_assert(&mut client, SmtpStatus::SERVICE_READY).await;
+
+        // Unknown command
+        write_command_expect(&mut client, "INVALID", SmtpStatus::ERROR_SYNTAX).await;
+
+        write_command_expect(&mut client, "HELO client.example.com", SmtpStatus::OK).await;
+
+        // Invalid MAIL FROM syntax (missing angle brackets)
+        write_command_expect(
+            &mut client,
+            "MAIL FROM:sender@example.com",
+            SmtpStatus::ERROR_SYNTAX,
+        )
+        .await;
+
+        write_command_expect(&mut client, "QUIT", SmtpStatus::BYE).await;
+
+        drop(client);
+        let _ = server.await;
+    }
+
+    /// Test RSET and NOOP commands
+    #[tokio::test]
+    async fn test_smtp_utility_commands() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream, mock_send_ok).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        read_line_assert(&mut client, SmtpStatus::SERVICE_READY).await;
+
+        // Test NOOP
+        write_command_expect(&mut client, "NOOP", SmtpStatus::OK).await;
+
+        // Start a transaction
+        write_command_expect(&mut client, "HELO client.example.com", SmtpStatus::OK).await;
+        write_command_expect(
+            &mut client,
+            "MAIL FROM:<sender@example.com>",
+            SmtpStatus::OK,
+        )
+        .await;
+        write_command_expect(
+            &mut client,
+            "RCPT TO:<recipient@example.com>",
+            SmtpStatus::OK,
+        )
+        .await;
+
+        // Reset transaction
+        write_command_expect(&mut client, "RSET", SmtpStatus::OK).await;
+
+        // Can start new transaction after RSET
+        write_command_expect(&mut client, "HELO client.example.com", SmtpStatus::OK).await;
+        write_command_expect(
+            &mut client,
+            "MAIL FROM:<sender2@example.com>",
+            SmtpStatus::OK,
+        )
+        .await;
+
+        write_command_expect(&mut client, "QUIT", SmtpStatus::BYE).await;
+
+        drop(client);
+        let _ = server.await;
+    }
+
+    /// Test the complete happy path: HELO -> MAIL -> RCPT -> DATA -> QUIT
+    #[tokio::test]
+    async fn test_smtp_happy_path() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream, mock_send_ok).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+
+        // Greeting
+        read_line_assert(&mut client, SmtpStatus::SERVICE_READY).await;
+
+        // HELO
+        write_command_expect(&mut client, "HELO client.example.com", SmtpStatus::OK).await;
+
+        // MAIL FROM
+        write_command_expect(
+            &mut client,
+            "MAIL FROM:<sender@example.com>",
+            SmtpStatus::OK,
+        )
+        .await;
+
+        // RCPT TO
+        write_command_expect(
+            &mut client,
+            "RCPT TO:<recipient@example.com>",
+            SmtpStatus::OK,
+        )
+        .await;
+
+        // QUIT
+        write_command_expect(&mut client, "QUIT", SmtpStatus::BYE).await;
+
+        drop(client);
+        let _ = server.await;
+    }
+
+    /// Test sending an email with an attachment
+    #[tokio::test]
+    async fn test_smtp_with_attachment() {
+        use std::sync::OnceLock;
+
+        // Track the message sent to verify attachment is included
+        let captured_message = Arc::new(OnceLock::new());
+        let captured_clone = captured_message.clone();
+
+        let mock_send_with_capture = async move |message: acs::EmailMessage| {
+            captured_clone.set(message).unwrap();
+            SmtpResult::ok()
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream, mock_send_with_capture).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        read_line_assert(&mut client, SmtpStatus::SERVICE_READY).await;
+
+        // HELO
+        write_command_expect(&mut client, "HELO client.example.com", SmtpStatus::OK).await;
+
+        // MAIL FROM
+        write_command_expect(
+            &mut client,
+            "MAIL FROM:<sender@example.com>",
+            SmtpStatus::OK,
+        )
+        .await;
+
+        // RCPT TO
+        write_command_expect(
+            &mut client,
+            "RCPT TO:<recipient@example.com>",
+            SmtpStatus::OK,
+        )
+        .await;
+
+        // DATA with MIME-encoded attachment
+        write_command_expect(&mut client, "DATA", SmtpStatus::START_MAIL_INPUT).await;
+
+        // Send a MIME message with attachment
+        let mime_message = indoc::indoc! {"
+            From: sender@example.com\r
+            To: recipient@example.com\r
+            Subject: Test with Attachment\r
+            MIME-Version: 1.0\r
+            Content-Type: multipart/mixed; boundary=\"boundary123\"\r
+            \r
+            --boundary123\r
+            Content-Type: text/plain; charset=\"utf-8\"\r
+            \r
+            This is the email body with an attachment.\r
+            \r
+            --boundary123\r
+            Content-Type: text/plain; name=\"test.txt\"\r
+            Content-Transfer-Encoding: base64\r
+            Content-Disposition: attachment; filename=\"test.txt\"\r
+            Content-Id: <testfile>\r
+            \r
+            SGVsbG8sIFdvcmxkIQ==\r
+            \r
+            --boundary123--\r
+        "};
+
+        client.write_all(mime_message.as_bytes()).await.unwrap();
+
+        // Should get OK response
+        write_command_expect(&mut client, ".", SmtpStatus::OK).await;
+
+        // QUIT
+        write_command_expect(&mut client, "QUIT", SmtpStatus::BYE).await;
+
+        drop(client);
+        let _ = server.await;
+
+        // Verify the captured message contains the expected data
+        let msg = captured_message
+            .get()
+            .expect("message should have been captured");
+        assert_eq!(msg.sender_address, "sender@example.com");
+        assert_eq!(msg.content.subject, "Test with Attachment");
+        assert_eq!(msg.recipients.to.len(), 1);
+        assert_eq!(msg.recipients.to[0].address, "recipient@example.com");
+        assert!(msg.content.plain_text.is_some());
+        assert!(
+            msg.content
+                .plain_text
+                .as_ref()
+                .unwrap()
+                .contains("This is the email body with an attachment")
+        );
+        // Verify attachment was parsed correctly
+        assert!(msg.attachments.is_some());
+        let attachments = msg.attachments.as_ref().unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(
+            attachments[0],
+            crate::acs::EmailAttachment {
+                name: "test.txt".to_string(),
+                content_type: "text/plain".to_string(),
+                content_in_base64: "SGVsbG8sIFdvcmxkIQ==".to_string(),
+                content_id: Some("testfile".to_string()),
+            }
+        );
     }
 }
